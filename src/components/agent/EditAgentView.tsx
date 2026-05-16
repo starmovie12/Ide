@@ -1,11 +1,18 @@
-import { useState, useEffect } from 'react';
-import { X, Info, AlertTriangle } from 'lucide-react';
+/**
+ * EditAgentView — v6 Phase 5
+ * Bug #B30: Autosave unsaved form changes to agentDraftStore on every keystroke.
+ *           Restores draft on remount so navigation doesn't lose work.
+ */
+
+import { useState, useEffect, useCallback } from 'react';
+import { X, Info, AlertTriangle, Save } from 'lucide-react';
 import { PrimaryButton } from '@/components/ui/PrimaryButton';
 import { SecondaryButton } from '@/components/ui/SecondaryButton';
 import { DeleteAgentButton } from '@/components/agent/DeleteAgentButton';
 import { ModelSelector, type GeminiModel } from '@/components/agent/ModelSelector';
 import { AgentRoutingPicker } from '@/components/agent/AgentRoutingPicker';
 import { useAgentStore, type Agent } from '@/lib/store/agentStore';
+import { useAgentDraftStore } from '@/lib/store/agentDraftStore';
 
 const EMOJI_OPTIONS = [
   '🤖', '🧠', '⚡', '🔧', '🛠️', '💡', '🎯', '🚀', '🔍', '🐛',
@@ -33,6 +40,9 @@ export function EditAgentView({ open, onClose, agentId, chatId }: EditAgentViewP
     removeChatAgent,
   } = useAgentStore();
 
+  // Bug #B30 — agentDraftStore for autosave
+  const { saveDraft, getDraft, clearDraft } = useAgentDraftStore();
+
   const isChatInstance = !!chatId;
 
   // Find the agent to edit
@@ -52,10 +62,25 @@ export function EditAgentView({ open, onClose, agentId, chatId }: EditAgentViewP
   const [routeOutputTo, setRouteOutputTo] = useState<string | null>(null);
   const [showEmojiPicker, setShowEmojiPicker] = useState(false);
   const [showXmlHint, setShowXmlHint] = useState(false);
+  const [hasDraft, setHasDraft] = useState(false);
 
-  // Populate fields when agent is loaded
+  // Bug #B30: Populate fields — check for saved draft first, fall back to sourceAgent
   useEffect(() => {
-    if (sourceAgent) {
+    if (!open || !sourceAgent) return;
+
+    const draft = getDraft(agentId);
+    if (draft) {
+      // Restore from draft (unsaved navigation happened)
+      setName(draft.name);
+      setEmoji(draft.emoji);
+      setRole(draft.role);
+      setModel(draft.model as GeminiModel);
+      setTemperature(draft.temperature);
+      setSystemPrompt(draft.systemPrompt);
+      setColor(draft.color);
+      setHasDraft(true);
+    } else {
+      // Load from source agent
       setName(sourceAgent.name);
       setEmoji(sourceAgent.emoji);
       setRole(sourceAgent.role);
@@ -64,8 +89,27 @@ export function EditAgentView({ open, onClose, agentId, chatId }: EditAgentViewP
       setSystemPrompt(sourceAgent.systemPrompt);
       setColor(sourceAgent.color);
       setRouteOutputTo(sourceAgent.routeOutputTo);
+      setHasDraft(false);
     }
-  }, [sourceAgent?.id, open]);
+  }, [sourceAgent?.id, open, agentId, getDraft]);
+
+  // Bug #B30: Autosave draft on every field change
+  const persistDraft = useCallback(
+    (fields: {
+      name: string;
+      emoji: string;
+      role: string;
+      model: string;
+      temperature: number;
+      systemPrompt: string;
+      color: string;
+    }) => {
+      if (!sourceAgent) return;
+      // Only save if something has changed from the saved version
+      saveDraft(agentId, fields);
+    },
+    [agentId, saveDraft, sourceAgent]
+  );
 
   if (!open || !sourceAgent) return null;
 
@@ -87,6 +131,8 @@ export function EditAgentView({ open, onClose, agentId, chatId }: EditAgentViewP
     } else {
       updateTemplate(agentId, updates);
     }
+    // Bug #B30: clear draft on successful save
+    clearDraft(agentId);
     onClose();
   };
 
@@ -96,7 +142,54 @@ export function EditAgentView({ open, onClose, agentId, chatId }: EditAgentViewP
     } else {
       deleteTemplate(agentId);
     }
+    clearDraft(agentId);
     onClose();
+  };
+
+  const handleDiscardDraft = () => {
+    clearDraft(agentId);
+    setHasDraft(false);
+    if (sourceAgent) {
+      setName(sourceAgent.name);
+      setEmoji(sourceAgent.emoji);
+      setRole(sourceAgent.role);
+      setModel(sourceAgent.model as GeminiModel);
+      setTemperature(sourceAgent.temperature);
+      setSystemPrompt(sourceAgent.systemPrompt);
+      setColor(sourceAgent.color);
+      setRouteOutputTo(sourceAgent.routeOutputTo);
+    }
+  };
+
+  // Shared onChange wrapper that persists draft after state update
+  const handleNameChange = (v: string) => {
+    setName(v);
+    persistDraft({ name: v, emoji, role, model, temperature, systemPrompt, color });
+  };
+  const handleEmojiChange = (v: string) => {
+    setEmoji(v);
+    setShowEmojiPicker(false);
+    persistDraft({ name, emoji: v, role, model, temperature, systemPrompt, color });
+  };
+  const handleRoleChange = (v: string) => {
+    setRole(v);
+    persistDraft({ name, emoji, role: v, model, temperature, systemPrompt, color });
+  };
+  const handleModelChange = (v: GeminiModel) => {
+    setModel(v);
+    persistDraft({ name, emoji, role, model: v, temperature, systemPrompt, color });
+  };
+  const handleTemperatureChange = (v: number) => {
+    setTemperature(v);
+    persistDraft({ name, emoji, role, model, temperature: v, systemPrompt, color });
+  };
+  const handleSystemPromptChange = (v: string) => {
+    setSystemPrompt(v);
+    persistDraft({ name, emoji, role, model, temperature, systemPrompt: v, color });
+  };
+  const handleColorChange = (v: string) => {
+    setColor(v);
+    persistDraft({ name, emoji, role, model, temperature, systemPrompt, color: v });
   };
 
   return (
@@ -138,6 +231,34 @@ export function EditAgentView({ open, onClose, agentId, chatId }: EditAgentViewP
             <X size={18} />
           </button>
         </div>
+
+        {/* Bug #B30 — unsaved draft banner */}
+        {hasDraft && (
+          <div
+            style={{
+              display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8,
+              marginBottom: 16, background: 'var(--color-warning-subtle)',
+              border: '1px solid rgba(245,158,11,0.3)', borderRadius: 'var(--radius-base)',
+              padding: '8px 12px',
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <Save size={13} style={{ color: 'var(--color-warning)', flexShrink: 0 }} />
+              <span style={{ fontSize: 12, color: 'var(--color-warning)', fontFamily: 'var(--font-body)' }}>
+                Unsaved draft restored from previous session.
+              </span>
+            </div>
+            <button
+              onClick={handleDiscardDraft}
+              style={{
+                fontSize: 11, color: 'var(--color-warning)', background: 'none', border: 'none',
+                cursor: 'pointer', fontFamily: 'var(--font-body)', fontWeight: 600, whiteSpace: 'nowrap',
+              }}
+            >
+              Discard
+            </button>
+          </div>
+        )}
 
         {/* Context notice */}
         <div
@@ -184,7 +305,7 @@ export function EditAgentView({ open, onClose, agentId, chatId }: EditAgentViewP
                     boxShadow: 'var(--shadow-dropdown)',
                   }}>
                     {EMOJI_OPTIONS.map((e) => (
-                      <button key={e} onClick={() => { setEmoji(e); setShowEmojiPicker(false); }}
+                      <button key={e} onClick={() => handleEmojiChange(e)}
                         style={{
                           width: 32, height: 32, borderRadius: 6, border: 'none', cursor: 'pointer', fontSize: 18,
                           background: emoji === e ? 'var(--color-primary-subtle)' : 'none',
@@ -200,7 +321,7 @@ export function EditAgentView({ open, onClose, agentId, chatId }: EditAgentViewP
               <input
                 data-testid="input-edit-agent-name"
                 value={name}
-                onChange={(e) => setName(e.target.value)}
+                onChange={(e) => handleNameChange(e.target.value)}
                 style={inputStyle}
               />
             </div>
@@ -211,7 +332,7 @@ export function EditAgentView({ open, onClose, agentId, chatId }: EditAgentViewP
             <label style={labelStyle}>Role / Description</label>
             <textarea
               value={role}
-              onChange={(e) => setRole(e.target.value)}
+              onChange={(e) => handleRoleChange(e.target.value)}
               rows={2}
               style={{ ...inputStyle, height: 'auto', resize: 'vertical', paddingTop: 10, paddingBottom: 10 }}
             />
@@ -220,7 +341,7 @@ export function EditAgentView({ open, onClose, agentId, chatId }: EditAgentViewP
           {/* Model */}
           <div>
             <label style={labelStyle}>Model</label>
-            <ModelSelector value={model} onChange={setModel} />
+            <ModelSelector value={model} onChange={handleModelChange} />
           </div>
 
           {/* Temperature */}
@@ -233,7 +354,7 @@ export function EditAgentView({ open, onClose, agentId, chatId }: EditAgentViewP
             </div>
             <input
               type="range" min={0} max={1} step={0.05} value={temperature}
-              onChange={(e) => setTemperature(parseFloat(e.target.value))}
+              onChange={(e) => handleTemperatureChange(parseFloat(e.target.value))}
               style={{ width: '100%', accentColor: 'var(--color-primary)' }}
             />
             <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 4 }}>
@@ -262,7 +383,7 @@ export function EditAgentView({ open, onClose, agentId, chatId }: EditAgentViewP
             )}
             <textarea
               value={systemPrompt}
-              onChange={(e) => setSystemPrompt(e.target.value)}
+              onChange={(e) => handleSystemPromptChange(e.target.value)}
               rows={5}
               style={{ ...inputStyle, height: 'auto', resize: 'vertical', paddingTop: 10, paddingBottom: 10, fontFamily: 'var(--font-mono)', fontSize: 13 }}
             />
@@ -282,7 +403,7 @@ export function EditAgentView({ open, onClose, agentId, chatId }: EditAgentViewP
             <label style={labelStyle}>Color</label>
             <div style={{ display: 'flex', gap: 8 }}>
               {AGENT_COLORS.map((c) => (
-                <button key={c} onClick={() => setColor(c)}
+                <button key={c} onClick={() => handleColorChange(c)}
                   style={{
                     width: 28, height: 28, borderRadius: '50%', background: c, cursor: 'pointer',
                     border: color === c ? '3px solid white' : '3px solid transparent',
