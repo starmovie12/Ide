@@ -1,13 +1,198 @@
+/**
+ * Header — v6 Phase 5
+ * §2.4: Quota health pill showing aggregate daily Flash usage across all keys.
+ *       Color: green < 70%, amber 70–90%, red > 90%.
+ *       Click → per-key breakdown tooltip.
+ */
+
 import { useEffect, useRef, useState } from 'react';
-import { Menu, Plus, Download, Pencil, Check, X, MoreVertical } from 'lucide-react';
+import { Menu, Plus, Download, Pencil, Check, X, MoreVertical, Zap } from 'lucide-react';
 import { useUIStore } from '@/lib/store/uiStore';
 import { useChatStore } from '@/lib/store/chatStore';
 import { useEditorStore } from '@/lib/store/editorStore';
+import { useAPIKeyStore } from '@/lib/store/apiKeyStore';
 import { exportAsZip } from '@/lib/io/zipExport';
 import { cn } from '@/lib/utils/cn';
 
+/** Flash RPD cap per key — used to compute aggregate cap */
+const FLASH_RPD_PER_KEY = 1500;
+
 interface HeaderProps {
   onAddAgent?: () => void;
+}
+
+/**
+ * §2.4 Quota Health Pill
+ * Shows aggregate Flash daily usage across all keys.
+ */
+function QuotaPill() {
+  const keys = useAPIKeyStore((s) => s.keys);
+  const [expanded, setExpanded] = useState(false);
+  const pillRef = useRef<HTMLDivElement>(null);
+
+  // Close on outside click
+  useEffect(() => {
+    if (!expanded) return;
+    function handle(e: MouseEvent) {
+      if (pillRef.current && !pillRef.current.contains(e.target as Node)) {
+        setExpanded(false);
+      }
+    }
+    document.addEventListener('mousedown', handle);
+    return () => document.removeEventListener('mousedown', handle);
+  }, [expanded]);
+
+  if (keys.length === 0) return null;
+
+  const activeKeys = keys.filter((k) => k.status !== 'dead');
+  const totalCap = activeKeys.length * FLASH_RPD_PER_KEY;
+  const totalUsed = activeKeys.reduce((sum, k) => sum + (k.dailyRequests ?? 0), 0);
+
+  const pct = totalCap > 0 ? totalUsed / totalCap : 0;
+  const pillColor =
+    pct >= 0.9
+      ? 'var(--color-destructive)'
+      : pct >= 0.7
+      ? 'var(--color-warning)'
+      : 'var(--color-success)';
+
+  const pillBg =
+    pct >= 0.9
+      ? 'var(--color-destructive-subtle)'
+      : pct >= 0.7
+      ? 'var(--color-warning-subtle)'
+      : 'var(--color-success-subtle)';
+
+  return (
+    <div ref={pillRef} style={{ position: 'relative' }}>
+      <button
+        onClick={() => setExpanded((o) => !o)}
+        aria-label={`Quota: ${totalUsed} of ${totalCap} Flash calls used today`}
+        title="API Quota — click for details"
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 5,
+          padding: '4px 8px',
+          borderRadius: 'var(--radius-full)',
+          border: `1px solid ${pillColor}`,
+          background: pillBg,
+          cursor: 'pointer',
+          color: pillColor,
+          fontSize: 11,
+          fontFamily: 'var(--font-numeric)',
+          fontWeight: 600,
+          whiteSpace: 'nowrap',
+          transition: 'all 150ms',
+        }}
+      >
+        <Zap size={11} />
+        {totalUsed.toLocaleString()} / {totalCap.toLocaleString()}
+      </button>
+
+      {/* §2.4 per-key breakdown dropdown */}
+      {expanded && (
+        <div
+          style={{
+            position: 'absolute',
+            top: 'calc(100% + 8px)',
+            right: 0,
+            minWidth: 240,
+            background: 'var(--bg-surface-overlay)',
+            border: '1px solid var(--border-default)',
+            borderRadius: 'var(--radius-lg)',
+            boxShadow: 'var(--shadow-overlay)',
+            padding: '10px',
+            zIndex: 200,
+          }}
+        >
+          <p
+            style={{
+              margin: '0 0 8px',
+              fontSize: 10,
+              fontWeight: 700,
+              letterSpacing: '0.08em',
+              textTransform: 'uppercase',
+              color: 'var(--text-quaternary)',
+              fontFamily: 'var(--font-label)',
+            }}
+          >
+            Daily Flash Usage
+          </p>
+          {activeKeys.map((k) => {
+            const used = k.dailyRequests ?? 0;
+            const kPct = Math.min(used / FLASH_RPD_PER_KEY, 1);
+            const kColor =
+              kPct >= 0.9
+                ? 'var(--color-destructive)'
+                : kPct >= 0.7
+                ? 'var(--color-warning)'
+                : 'var(--color-success)';
+            return (
+              <div key={k.id} style={{ marginBottom: 8 }}>
+                <div
+                  style={{
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    marginBottom: 3,
+                  }}
+                >
+                  <span
+                    style={{
+                      fontSize: 12,
+                      color: 'var(--text-secondary)',
+                      fontFamily: 'var(--font-body)',
+                    }}
+                  >
+                    {k.label || `Key …${k.key.slice(-4)}`}
+                  </span>
+                  <span
+                    style={{
+                      fontSize: 11,
+                      color: kColor,
+                      fontFamily: 'var(--font-numeric)',
+                      fontWeight: 600,
+                    }}
+                  >
+                    {used} / {FLASH_RPD_PER_KEY}
+                  </span>
+                </div>
+                {/* Progress bar */}
+                <div
+                  style={{
+                    height: 3,
+                    background: 'var(--bg-surface-sunken)',
+                    borderRadius: 2,
+                    overflow: 'hidden',
+                  }}
+                >
+                  <div
+                    style={{
+                      height: '100%',
+                      width: `${Math.round(kPct * 100)}%`,
+                      background: kColor,
+                      borderRadius: 2,
+                      transition: 'width 300ms',
+                    }}
+                  />
+                </div>
+              </div>
+            );
+          })}
+          <p
+            style={{
+              margin: '6px 0 0',
+              fontSize: 10,
+              color: 'var(--text-quaternary)',
+              fontFamily: 'var(--font-body)',
+            }}
+          >
+            Resets at midnight US/Pacific · Add keys in Settings
+          </p>
+        </div>
+      )}
+    </div>
+  );
 }
 
 export function Header({ onAddAgent }: HeaderProps) {
@@ -201,6 +386,9 @@ export function Header({ onAddAgent }: HeaderProps) {
           </div>
         )}
       </div>
+
+      {/* §2.4 Quota health pill — rightmost before action buttons */}
+      <QuotaPill />
 
       <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
         {/* Rename */}
