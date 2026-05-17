@@ -30,7 +30,7 @@ export interface BlueprintState {
   setBuildingChatId: (chatId: string | null) => void;
   updateBlueprintProgress: (chatId: string, phase: string, done: number, total: number) => void;
 
-  setGitHubToken: (token: string | null) => void;
+  setGitHubToken: (token: string | null, user?: GitHubConnection['user'] | null) => void;
   setGitHubUser: (user: GitHubConnection['user'] | null) => void;
   connectRepo: (chatId: string, connection: GitHubConnection) => void;
   disconnectRepo: (chatId: string) => void;
@@ -74,7 +74,8 @@ export const useBlueprintStore = create<BlueprintState>()((set, get) => ({
     });
   },
 
-  setGitHubToken: (token) => set({ githubToken: token }),
+  setGitHubToken: (token, user) =>
+    set({ githubToken: token, ...(user !== undefined ? { githubUser: user } : {}) }),
   setGitHubUser: (user) => set({ githubUser: user }),
 
   connectRepo: (chatId, connection) => {
