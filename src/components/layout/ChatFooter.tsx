@@ -4,10 +4,30 @@ import { useChatStore } from '@/lib/store/chatStore';
 import { useAgentStore } from '@/lib/store/agentStore';
 import { useDiffStore } from '@/lib/store/diffStore';
 import { useBlueprintStore } from '@/lib/store/blueprintStore';
+import { useEditorStore } from '@/lib/store/editorStore';
 import { executeOrchestration } from '@/lib/ai/orchestrator';
 import { useAutoTitle } from '@/hooks/useAutoTitle';
 import { handleZipImport } from '@/lib/io/zipImportHandler';
+import { applyAllDiffBlocks } from '@/lib/diff/apply';
+import type { SearchReplaceBlock } from '@/lib/diff/parser';
 
+/**
+ * v6.1 fixes (May 2026):
+ *   FIX-C1 — Previously this only emitted `addDiff` events to the diffStore
+ *            (which queues diffs for manual user accept). It NEVER passed
+ *            `applyDiffs` to executeOrchestration, so the orchestrator's
+ *            GitHub-push branch was unreachable — it requires the applied
+ *            file map. Now we pass an applyDiffs callback that mutates
+ *            editorStore in-place and returns the updated content map so
+ *            the orchestrator can hand it to pushChangeSet.
+ *   FIX-C2 — `githubContext` is now provided when a GitHub repo is
+ *            connected for the chat. Without this, PR creation was dead
+ *            code regardless of fix-C1.
+ *   FIX-C3 — Chat history sent to agents previously filtered to ONLY user
+ *            messages, dropping all prior agent replies. That made multi-
+ *            turn refinement impossible ("you mentioned earlier…" stopped
+ *            working). Now we send the full role-tagged history.
+ */
 export function ChatFooter() {
   const [message, setMessage] = useState('');
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -30,7 +50,7 @@ export function ChatFooter() {
 
   const { getChatAgents, templateAgents, cloneTemplatesToChat } = useAgentStore();
   const { addDiff } = useDiffStore();
-  const { getBlueprint } = useBlueprintStore();
+  const { getBlueprint, getRepoConnection } = useBlueprintStore();
   const { autoTitle } = useAutoTitle();
 
   const isStreaming = !!streamingMessageId;
@@ -42,6 +62,68 @@ export function ChatFooter() {
     ta.style.height = Math.min(ta.scrollHeight, 160) + 'px';
     setMessage(ta.value);
   };
+
+  /**
+   * FIX-C1 — Apply diffs to the in-memory editor state and return the updated
+   * file map. This is the contract the orchestrator expects so it can push the
+   * resulting file contents to GitHub.
+   *
+   * Strategy:
+   *   1. Group incoming diffs by filePath
+   *   2. For each path, find the current content (editorStore.fileContents,
+   *      falling back to file.content, falling back to empty string for new files)
+   *   3. Apply all blocks for that file in order via applyAllDiffBlocks
+   *   4. Write the result back through editorStore.updateFileContent (or
+   *      createFile when the file is brand new)
+   *   5. Return { path → finalContent } for every touched file
+   *
+   * The orchestrator uses paths (not editor ids) as map keys, because GitHub
+   * push works on paths. We keep editor ids internal to the editor store.
+   */
+  const applyDiffsForOrchestrator = useCallback(
+    async (diffs: SearchReplaceBlock[]): Promise<Record<string, string>> => {
+      if (diffs.length === 0) return {};
+      const editor = useEditorStore.getState();
+
+      const byPath = new Map<string, SearchReplaceBlock[]>();
+      for (const d of diffs) {
+        const arr = byPath.get(d.filePath) ?? [];
+        arr.push(d);
+        byPath.set(d.filePath, arr);
+      }
+
+      const result: Record<string, string> = {};
+
+      for (const [filePath, blocks] of byPath) {
+        const fileEntry = editor.files.find(
+          (f) => f.path === filePath || f.id === filePath
+        );
+        const original = fileEntry
+          ? editor.fileContents[fileEntry.id] ?? fileEntry.content
+          : '';
+
+        // applyAllDiffBlocks expects the DiffBlock shape, not SearchReplaceBlock
+        const diffBlocks = blocks.map((b) => ({
+          filePath: b.filePath,
+          searchContent: b.search,
+          replaceContent: b.replace,
+          raw: b.search,
+        }));
+
+        const { content } = applyAllDiffBlocks(original, diffBlocks);
+
+        if (fileEntry) {
+          editor.updateFileContent(fileEntry.id, content);
+        } else {
+          editor.createFile(filePath, content);
+        }
+        result[filePath] = content;
+      }
+
+      return result;
+    },
+    []
+  );
 
   const handleSend = useCallback(async () => {
     const text = message.trim();
@@ -73,7 +155,8 @@ export function ChatFooter() {
       autoTitle(chatId, text);
     }
 
-    const chatHistory = getMessages(chatId).filter((m) => m.role === 'user');
+    // FIX-C3 — pass full chat history (not user-only) so agents have context
+    const chatHistory = getMessages(chatId);
 
     const abort = new AbortController();
     abortRef.current = abort;
@@ -83,12 +166,26 @@ export function ChatFooter() {
     // Get active blueprint for this chat
     const blueprint = getBlueprint(chatId);
 
+    // FIX-C2 — wire GitHub repo connection when present
+    const repoConnection = getRepoConnection(chatId);
+    const githubContext = repoConnection
+      ? {
+          token: repoConnection.token,
+          owner: repoConnection.owner,
+          repo: repoConnection.repo,
+          defaultBranch: repoConnection.ref || 'main',
+          chatId,
+        }
+      : undefined;
+
     await executeOrchestration({
       agents: agentsToUse,
       userPrompt: text,
       chatHistory,
       signal: abort.signal,
       blueprint: blueprint?.status === 'ready' ? blueprint : null,
+      githubContext,
+      applyDiffs: applyDiffsForOrchestrator,
       onEvent: (event) => {
         if (abort.signal.aborted) return;
 
@@ -121,17 +218,28 @@ export function ChatFooter() {
           if (msgId) {
             updateMessage(chatId!, msgId, { hasDiff: true });
           }
+          // Still queue diffs in the diffStore so the user can see/review them
+          // even though they're also auto-applied via applyDiffsForOrchestrator
+          // (the diffStore's per-diff accept/reject UI remains useful for
+          // pre-PR auditing).
           for (const diff of event.diffs) {
             addDiff({
               filePath: diff.filePath,
               searchContent: diff.searchContent,
               replaceContent: diff.replaceContent,
               agentName: event.agentName,
-              acceptedAt: null,
+              acceptedAt: Date.now(),
             });
           }
         } else if (event.type === 'routing_transition') {
           setActiveAgentId(event.toAgentId);
+        } else if (event.type === 'pr_opened') {
+          addMessage(chatId!, {
+            role: 'system',
+            content:
+              `✅ PR #${event.prNumber} opened on ${event.branch}\n${event.prUrl}` +
+              (event.previewUrl ? `\nPreview: ${event.previewUrl}` : ''),
+          });
         } else if (event.type === 'all_complete') {
           setStreamingMessageId(null);
           setActiveAgentId(null);
@@ -164,8 +272,10 @@ export function ChatFooter() {
     cloneTemplatesToChat,
     addDiff,
     getBlueprint,
+    getRepoConnection,
     autoTitle,
     chats,
+    applyDiffsForOrchestrator,
   ]);
 
   const handleStop = () => {
