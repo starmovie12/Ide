@@ -265,3 +265,37 @@ export async function deleteVerifyBranch(
     // ignore
   }
 }
+
+/**
+ * Upload a single file to the connected GitHub repo on the default branch.
+ * Used by the "Upload to GitHub" button in FileExplorer.
+ *
+ * Creates a commit directly on defaultBranch (no feature branch) because
+ * this is a manual, user-initiated, single-file publish action — not an
+ * AI-generated change set.
+ */
+export async function uploadSingleFile(opts: {
+  githubToken: string;
+  owner: string;
+  repo: string;
+  defaultBranch: string;
+  filePath: string;
+  fileContent: string;
+  commitMessage?: string;
+}): Promise<{ commitSha: string; fileUrl: string }> {
+  const { githubToken, owner, repo, defaultBranch, filePath, fileContent, commitMessage } = opts;
+
+  const message = commitMessage ?? `chore: upload ${filePath} via AI Agent Studio`;
+
+  const { commitSha } = await commitTreeChangeSet(
+    githubToken,
+    owner,
+    repo,
+    defaultBranch,
+    [{ path: filePath, content: fileContent }],
+    message
+  );
+
+  const fileUrl = `https://github.com/${owner}/${repo}/blob/${defaultBranch}/${filePath}`;
+  return { commitSha, fileUrl };
+}
