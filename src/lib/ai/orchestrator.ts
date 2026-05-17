@@ -94,6 +94,26 @@ function buildExecutionChain(agents: Agent[]): Agent[] | null {
   return chain;
 }
 
+/**
+ * Error class for stream-call failures inside an agent run.
+ * v6.1 — surfaces so executeOrchestration can react. Previously
+ * streamAgentCall emitted `{ type: 'error', message }` on quota / safety /
+ * 4xx / network failure, but callAgent's event handler only matched on
+ * `type: 'token'`, so errors were dropped on the floor. fullText stayed
+ * empty, the agent completed "successfully", and the user just saw an
+ * empty bubble with no clue what went wrong.
+ */
+export class StreamCallError extends Error {
+  isQuotaExhausted: boolean;
+  isAllKeysExhausted: boolean;
+  constructor(message: string, isQuotaExhausted = false, isAllKeysExhausted = false) {
+    super(message);
+    this.name = 'StreamCallError';
+    this.isQuotaExhausted = isQuotaExhausted;
+    this.isAllKeysExhausted = isAllKeysExhausted;
+  }
+}
+
 async function callAgent(
   agent: Agent,
   systemPrompt: string,
@@ -112,6 +132,13 @@ async function callAgent(
   let continuations = 0;
 
   const doStream = async (msgs: typeof contents) => {
+    // v6.1 — capture any error event the underlying stream emits and
+    // rethrow after the call resolves. We don't throw inside the event
+    // callback because streamAgentCall completes its own teardown
+    // (key release, logging) after that callback returns; throwing
+    // mid-callback would leak the key reservation.
+    let streamError: { message: string; isQuotaExhausted?: boolean; isAllKeysExhausted?: boolean } | null = null;
+
     await streamAgentCall(
       {
         model: agent.model || DEFAULT_MODEL,
@@ -124,10 +151,23 @@ async function callAgent(
         if (event.type === 'token') {
           fullText += event.text;
           onToken(event.text);
+        } else if (event.type === 'error') {
+          streamError = event;
         }
+        // 'done' is intentionally not handled — fullText is already
+        // accumulated by token events.
       },
       3
     );
+
+    if (streamError) {
+      const err = streamError as { message: string; isQuotaExhausted?: boolean; isAllKeysExhausted?: boolean };
+      throw new StreamCallError(
+        err.message,
+        err.isQuotaExhausted ?? false,
+        err.isAllKeysExhausted ?? false
+      );
+    }
   };
 
   await doStream(contents);
@@ -157,14 +197,79 @@ export async function executeOrchestration(config: OrchestrationConfig): Promise
 
   if (agents.length === 0) {
     onEvent({ type: 'error', message: 'No agents selected. Add agents from the pill bar.' });
+    onEvent({ type: 'all_complete' });
     return;
   }
 
   const chain = buildExecutionChain(agents);
   if (chain === null) {
     onEvent({ type: 'error', message: 'Agent routing cycle detected. Fix the routing configuration.' });
+    onEvent({ type: 'all_complete' });
     return;
   }
+
+  /*
+   * v6.1 — wrap the main orchestration body in try/catch so that
+   * StreamCallError (thrown by callAgent / the reviewer inline stream
+   * when Gemini returns 4xx / quota / safety / network errors) is
+   * surfaced to the UI as a visible `type: 'error'` event instead of
+   * silently aborting with an empty agent bubble and a stuck
+   * "Agents are working…" footer.
+   *
+   * We also ALWAYS emit `all_complete` in the finally block so the
+   * footer's red Stop button reverts to the regular Send button —
+   * previously any thrown error left the UI hung in streaming state.
+   */
+  try {
+    await runOrchestrationBody(
+      config,
+      chain,
+      agents,
+      onEvent,
+      signal,
+      blueprint,
+      githubContext,
+      applyDiffs
+    );
+  } catch (err) {
+    if (err instanceof StreamCallError) {
+      onEvent({
+        type: 'error',
+        message: err.isAllKeysExhausted
+          ? `${err.message} Add another API key in Settings → API Keys, then retry.`
+          : err.isQuotaExhausted
+          ? err.message
+          : `Agent call failed: ${err.message}`,
+      });
+    } else if (err instanceof Error && err.name === 'AbortError') {
+      // User pressed Stop — silent exit, no error toast.
+    } else {
+      onEvent({
+        type: 'error',
+        message: err instanceof Error ? err.message : 'Orchestration failed',
+      });
+    }
+  } finally {
+    onEvent({ type: 'all_complete' });
+  }
+}
+
+/**
+ * Extracted main orchestration body so the outer wrapper can apply
+ * uniform error/finalization handling. Pure refactor of what used to
+ * live inline in executeOrchestration.
+ */
+async function runOrchestrationBody(
+  config: OrchestrationConfig,
+  chain: Agent[],
+  agents: Agent[],
+  onEvent: OrchestrationConfig['onEvent'],
+  signal: OrchestrationConfig['signal'],
+  blueprint: OrchestrationConfig['blueprint'],
+  githubContext: OrchestrationConfig['githubContext'],
+  applyDiffs: OrchestrationConfig['applyDiffs']
+): Promise<void> {
+  const { userPrompt, chatHistory } = config;
 
   // Blueprint context injection
   let blueprintContext = '';
@@ -337,6 +442,8 @@ export async function executeOrchestration(config: OrchestrationConfig): Promise
             (reviewerFeedback ? `\n\nPrevious review feedback:\n${reviewerFeedback}` : '');
 
           let reviewOutput = '';
+          // v6.1 — same defensive capture as in callAgent
+          let reviewerStreamError: { message: string; isQuotaExhausted?: boolean; isAllKeysExhausted?: boolean } | null = null;
           await streamAgentCall(
             {
               model: reviewerAgent.model || DEFAULT_MODEL,
@@ -349,9 +456,19 @@ export async function executeOrchestration(config: OrchestrationConfig): Promise
               if (event.type === 'token') {
                 reviewOutput += event.text;
                 onEvent({ type: 'agent_token', agentId: reviewerAgent.id, token: event.text });
+              } else if (event.type === 'error') {
+                reviewerStreamError = event;
               }
             }
           );
+          if (reviewerStreamError) {
+            const err = reviewerStreamError as { message: string; isQuotaExhausted?: boolean; isAllKeysExhausted?: boolean };
+            throw new StreamCallError(
+              err.message,
+              err.isQuotaExhausted ?? false,
+              err.isAllKeysExhausted ?? false
+            );
+          }
 
           onEvent({
             type: 'agent_complete',
@@ -514,5 +631,6 @@ export async function executeOrchestration(config: OrchestrationConfig): Promise
     }
   }
 
-  onEvent({ type: 'all_complete' });
+  // 'all_complete' is emitted by the outer executeOrchestration wrapper
+  // in its `finally` block so it fires on both success and error paths.
 }
