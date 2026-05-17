@@ -1,6 +1,12 @@
 import { cn } from '@/lib/utils/cn';
 
-type StatusVariant = 'active' | 'warning' | 'dead';
+/**
+ * v6.1: `quota-exhausted` added to surface the new APIKey status from
+ * apiKeyStore (FIX-K1). Visually mapped to an amber-ish "warning" tone
+ * leaning toward orange so users can distinguish it from a transient
+ * warning at a glance.
+ */
+type StatusVariant = 'active' | 'warning' | 'dead' | 'quota-exhausted';
 
 interface StatusDotProps {
   variant: StatusVariant;
@@ -13,6 +19,10 @@ const VARIANT_COLORS: Record<StatusVariant, string> = {
   active: 'var(--color-api-active)',
   warning: 'var(--color-api-warning)',
   dead: 'var(--color-api-dead)',
+  // Falls back to var(--color-warning) — same hue family as 'warning' but
+  // styling layers (border / pill bg) can disambiguate by checking the
+  // status string directly.
+  'quota-exhausted': 'var(--color-warning)',
 };
 
 export function StatusDot({ variant, size = 8, className, pulse = false }: StatusDotProps) {
