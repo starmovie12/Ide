@@ -1,8 +1,36 @@
 import { useMemo } from 'react';
 import { GitMerge } from 'lucide-react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
+import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import { StreamingCursor } from './StreamingCursor';
 import { hasDiffBlocks, countDiffBlocks } from '@/lib/diff/parser';
 import { useDiffStore } from '@/lib/store/diffStore';
+
+/**
+ * v6.1 — proper Markdown rendering with syntax-highlighted code fences.
+ *
+ * Previously this component shipped a hand-rolled regex-based renderer that
+ * was brittle (broke on nested inline code, tables, task lists, multi-line
+ * fenced code with leading whitespace, etc.) and the resulting HTML was
+ * injected via dangerouslySetInnerHTML — so any future change had to fight
+ * both XSS escaping and the regex passes simultaneously.
+ *
+ * Now we use:
+ *   - react-markdown — well-tested, sanitised by default (no innerHTML)
+ *   - remark-gfm     — tables, strikethrough, task lists, autolinks, footnotes
+ *   - react-syntax-highlighter (Prism) — code fences with proper colouring
+ *
+ * Diff blocks (`<<<<<<< SEARCH … ======= … >>>>>>> REPLACE`) are still
+ * intercepted BEFORE Markdown so their distinctive 3-band colouring is
+ * preserved — those tokens aren't fenced code and Markdown would otherwise
+ * render them as plain text.
+ *
+ * While streaming the raw text is shown verbatim (incl. the cursor); only on
+ * stream completion does the Markdown renderer run. This avoids re-parsing
+ * the AST on every token and keeps streaming snappy.
+ */
 
 const AGENT_COLORS = [
   'var(--text-agent-1)',
@@ -23,6 +51,82 @@ interface AgentMessageProps {
   onViewDiff?: () => void;
 }
 
+interface ContentSegment {
+  kind: 'prose' | 'diff';
+  text: string;
+}
+
+/**
+ * Pull SEARCH/REPLACE diff blocks out of the message body so they can be
+ * rendered with the dedicated three-colour styling. Anything outside a diff
+ * block is returned as a 'prose' segment for ReactMarkdown.
+ *
+ * Matching is non-greedy and tolerant of trailing whitespace before the
+ * REPLACE marker so we don't get tripped up by the variations Gemini
+ * occasionally produces.
+ */
+function splitDiffsAndProse(content: string): ContentSegment[] {
+  const segments: ContentSegment[] = [];
+  const diffPattern = /<{7} SEARCH[\s\S]*?>{7} REPLACE/g;
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = diffPattern.exec(content)) !== null) {
+    if (match.index > lastIndex) {
+      segments.push({ kind: 'prose', text: content.slice(lastIndex, match.index) });
+    }
+    segments.push({ kind: 'diff', text: match[0] });
+    lastIndex = match.index + match[0].length;
+  }
+  if (lastIndex < content.length) {
+    segments.push({ kind: 'prose', text: content.slice(lastIndex) });
+  }
+  return segments;
+}
+
+function DiffSegment({ text }: { text: string }) {
+  // Each diff block has three named bands. We split on the markers and
+  // render each band with its corresponding colour bar. Anything before
+  // the first marker (typically the file path) is rendered as a header.
+  const searchIdx = text.indexOf('<<<<<<< SEARCH');
+  const sepIdx = text.indexOf('=======', searchIdx);
+  const replaceIdx = text.indexOf('>>>>>>> REPLACE', sepIdx);
+
+  if (searchIdx === -1 || sepIdx === -1 || replaceIdx === -1) {
+    // Malformed — fall back to monospace block so the user still sees it.
+    return (
+      <pre style={preFallbackStyle}>
+        <code>{text}</code>
+      </pre>
+    );
+  }
+
+  const filePath = text.slice(0, searchIdx).trim();
+  const searchBody = text.slice(searchIdx + '<<<<<<< SEARCH'.length, sepIdx).trim();
+  const replaceBody = text
+    .slice(sepIdx + '======='.length, replaceIdx)
+    .replace(/^\n/, '')
+    .replace(/\n$/, '');
+
+  return (
+    <div style={diffContainerStyle}>
+      {filePath && (
+        <div style={diffFilePathStyle}>
+          {filePath}
+        </div>
+      )}
+      <div style={diffBandRemoveStyle}>
+        <span style={diffBandLabelStyle}>− SEARCH</span>
+        <pre style={diffBandPreStyle}>{searchBody}</pre>
+      </div>
+      <div style={diffBandSeparatorStyle} />
+      <div style={diffBandAddStyle}>
+        <span style={diffBandLabelStyle}>+ REPLACE</span>
+        <pre style={diffBandPreStyle}>{replaceBody}</pre>
+      </div>
+    </div>
+  );
+}
+
 export function AgentMessage({
   agentName,
   agentEmoji,
@@ -36,15 +140,21 @@ export function AgentMessage({
   const color = AGENT_COLORS[agentColorIndex % AGENT_COLORS.length];
   const { pendingDiffs } = useDiffStore();
 
-  const containsDiffBlocks = useMemo(() => !isStreaming && hasDiffBlocks(content), [content, isStreaming]);
-  const diffCount = useMemo(() => (containsDiffBlocks ? countDiffBlocks(content) : 0), [content, containsDiffBlocks]);
+  const containsDiffBlocks = useMemo(
+    () => !isStreaming && hasDiffBlocks(content),
+    [content, isStreaming]
+  );
+  const diffCount = useMemo(
+    () => (containsDiffBlocks ? countDiffBlocks(content) : 0),
+    [content, containsDiffBlocks]
+  );
 
   const hasStagedDiffs = pendingDiffs.some((d) => d.agentName === agentName);
   const showDiffBadge = hasDiffProp || containsDiffBlocks || hasStagedDiffs;
 
-  const renderedContent = useMemo(() => {
-    if (isStreaming) return content;
-    return renderContent(content);
+  const segments = useMemo<ContentSegment[]>(() => {
+    if (isStreaming) return []; // streamed text rendered raw
+    return splitDiffsAndProse(content);
   }, [content, isStreaming]);
 
   return (
@@ -82,7 +192,13 @@ export function AgentMessage({
           {agentEmoji} {agentName}
         </span>
         {isStreaming && (
-          <span style={{ fontSize: 10, color: 'var(--text-quaternary)', fontFamily: 'var(--font-body)' }}>
+          <span
+            style={{
+              fontSize: 10,
+              color: 'var(--text-quaternary)',
+              fontFamily: 'var(--font-body)',
+            }}
+          >
             typing…
           </span>
         )}
@@ -112,7 +228,8 @@ export function AgentMessage({
         style={{
           background: 'var(--bg-surface)',
           border: '1px solid var(--border-default)',
-          borderRadius: 'var(--radius-xs) var(--radius-lg) var(--radius-lg) var(--radius-lg)',
+          borderRadius:
+            'var(--radius-xs) var(--radius-lg) var(--radius-lg) var(--radius-lg)',
           padding: '12px 14px',
           fontSize: 14,
           color: 'var(--text-ai)',
@@ -126,11 +243,21 @@ export function AgentMessage({
         {isStreaming ? (
           <span style={{ whiteSpace: 'pre-wrap' }}>{content}</span>
         ) : (
-          <div
-            className="agent-message-content"
-            style={{ whiteSpace: 'pre-wrap' }}
-            dangerouslySetInnerHTML={{ __html: renderedContent }}
-          />
+          <div className="agent-message-content">
+            {segments.map((seg, i) =>
+              seg.kind === 'diff' ? (
+                <DiffSegment key={i} text={seg.text} />
+              ) : (
+                <ReactMarkdown
+                  key={i}
+                  remarkPlugins={[remarkGfm]}
+                  components={markdownComponents}
+                >
+                  {seg.text}
+                </ReactMarkdown>
+              )
+            )}
+          </div>
         )}
         {isStreaming && <StreamingCursor />}
 
@@ -164,102 +291,318 @@ export function AgentMessage({
 
       {/* Timestamp */}
       {timestamp && !isStreaming && (
-        <span style={{ fontSize: 11, color: 'var(--text-quaternary)', fontFamily: 'var(--font-numeric)' }}>
-          {new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+        <span
+          style={{
+            fontSize: 11,
+            color: 'var(--text-quaternary)',
+            fontFamily: 'var(--font-numeric)',
+          }}
+        >
+          {new Date(timestamp).toLocaleTimeString([], {
+            hour: '2-digit',
+            minute: '2-digit',
+          })}
         </span>
       )}
     </div>
   );
 }
 
-function escapeHtml(s: string): string {
-  return s
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
-}
+/* ─────────────────────────────────────────────────────────────────────────
+ * ReactMarkdown component overrides — match the surrounding chat aesthetic
+ * (Glass-Era tokens) and keep typography compact for chat density.
+ * ───────────────────────────────────────────────────────────────────────── */
 
-function renderContent(content: string): string {
-  const lines = content.split('\n');
-  const result: string[] = [];
-  let inCode = false;
-  let codeLang = '';
-  let codeLines: string[] = [];
+type MarkdownProps = React.HTMLAttributes<HTMLElement> & {
+  children?: React.ReactNode;
+};
 
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const fenceMatch = line.match(/^```(\w*)$/);
+type CodeProps = MarkdownProps & {
+  inline?: boolean;
+  className?: string;
+};
 
-    if (fenceMatch && !inCode) {
-      inCode = true;
-      codeLang = fenceMatch[1] || 'plaintext';
-      codeLines = [];
-      continue;
-    }
+const markdownComponents = {
+  // Code: inline → tinted pill; fenced block → syntax-highlighted
+  code({ inline, className, children, ...props }: CodeProps) {
+    const text = String(children ?? '').replace(/\n$/, '');
+    const match = /language-(\w+)/.exec(className ?? '');
 
-    if (line.trim() === '```' && inCode) {
-      inCode = false;
-      result.push(
-        `<pre style="background:var(--bg-surface-sunken);border:1px solid var(--border-subtle);border-radius:6px;padding:10px 12px;overflow-x:auto;margin:8px 0;font-family:var(--font-mono);font-size:12px;line-height:1.5;"><code class="lang-${escapeHtml(codeLang)}">${escapeHtml(codeLines.join('\n'))}</code></pre>`
+    if (inline || !match) {
+      return (
+        <code
+          style={{
+            background: 'var(--bg-surface-sunken)',
+            borderRadius: 3,
+            padding: '1px 4px',
+            fontFamily: 'var(--font-mono)',
+            fontSize: 12,
+          }}
+          {...props}
+        >
+          {children}
+        </code>
       );
-      codeLines = [];
-      codeLang = '';
-      continue;
     }
 
-    if (inCode) {
-      codeLines.push(line);
-      continue;
-    }
-
-    if (line.trim() === '<<<<<<< SEARCH' || line.trim().startsWith('<<<<<<< SEARCH')) {
-      result.push(
-        `<div style="background:var(--bg-diff-remove,#1f0d0d);border-left:3px solid var(--color-destructive);padding:2px 8px;font-family:var(--font-mono);font-size:11px;color:var(--color-destructive)">${escapeHtml(line)}</div>`
-      );
-      continue;
-    }
-    if (line.trim() === '=======' && !inCode) {
-      result.push(
-        `<div style="background:var(--bg-surface-sunken);border-left:3px solid var(--text-quaternary);padding:2px 8px;font-family:var(--font-mono);font-size:11px;color:var(--text-quaternary)">${escapeHtml(line)}</div>`
-      );
-      continue;
-    }
-    if (line.trim() === '>>>>>>> REPLACE') {
-      result.push(
-        `<div style="background:var(--bg-diff-add,#0d1f12);border-left:3px solid var(--color-success);padding:2px 8px;font-family:var(--font-mono);font-size:11px;color:var(--color-success)">${escapeHtml(line)}</div>`
-      );
-      continue;
-    }
-
-    let rendered = escapeHtml(line);
-    rendered = rendered.replace(/`([^`]+)`/g, '<code style="background:var(--bg-surface-sunken);border-radius:3px;padding:1px 4px;font-family:var(--font-mono);font-size:12px;">$1</code>');
-    rendered = rendered.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
-    rendered = rendered.replace(/\*([^*]+)\*/g, '<em>$1</em>');
-
-    if (/^#{1,3}\s/.test(line)) {
-      const level = line.match(/^(#{1,3})/)?.[1].length ?? 1;
-      const text = rendered.replace(/^#{1,3}\s/, '');
-      const sizes = [16, 14, 13];
-      result.push(
-        `<div style="font-weight:700;font-size:${sizes[level - 1]}px;margin:10px 0 4px;font-family:var(--font-display)">${text}</div>`
-      );
-      continue;
-    }
-
-    if (/^[-*]\s/.test(line)) {
-      result.push(`<div style="padding-left:14px;margin:1px 0">• ${rendered.replace(/^[-*]\s/, '')}</div>`);
-      continue;
-    }
-
-    result.push(`<span>${rendered}</span>${i < lines.length - 1 ? '\n' : ''}`);
-  }
-
-  if (inCode && codeLines.length > 0) {
-    result.push(
-      `<pre style="background:var(--bg-surface-sunken);border:1px solid var(--border-subtle);border-radius:6px;padding:10px 12px;overflow-x:auto;margin:8px 0;font-family:var(--font-mono);font-size:12px;"><code>${escapeHtml(codeLines.join('\n'))}</code></pre>`
+    return (
+      <SyntaxHighlighter
+        // oneDark blends well with the dark Glass surface; we override the
+        // default background so the highlighter doesn't fight the bubble.
+        style={oneDark}
+        language={match[1]}
+        PreTag="div"
+        customStyle={{
+          background: 'var(--bg-surface-sunken)',
+          border: '1px solid var(--border-subtle)',
+          borderRadius: 6,
+          padding: '10px 12px',
+          margin: '8px 0',
+          fontSize: 12,
+          lineHeight: 1.5,
+        }}
+        codeTagProps={{
+          style: { fontFamily: 'var(--font-mono)' },
+        }}
+      >
+        {text}
+      </SyntaxHighlighter>
     );
-  }
+  },
 
-  return result.join('');
-}
+  p({ children }: MarkdownProps) {
+    return <p style={{ margin: '4px 0' }}>{children}</p>;
+  },
+
+  ul({ children }: MarkdownProps) {
+    return (
+      <ul style={{ margin: '6px 0', paddingLeft: 20, listStyle: 'disc' }}>
+        {children}
+      </ul>
+    );
+  },
+
+  ol({ children }: MarkdownProps) {
+    return (
+      <ol style={{ margin: '6px 0', paddingLeft: 20, listStyle: 'decimal' }}>
+        {children}
+      </ol>
+    );
+  },
+
+  li({ children }: MarkdownProps) {
+    return <li style={{ margin: '2px 0' }}>{children}</li>;
+  },
+
+  h1({ children }: MarkdownProps) {
+    return (
+      <h1
+        style={{
+          fontFamily: 'var(--font-display)',
+          fontSize: 18,
+          fontWeight: 700,
+          margin: '12px 0 6px',
+        }}
+      >
+        {children}
+      </h1>
+    );
+  },
+
+  h2({ children }: MarkdownProps) {
+    return (
+      <h2
+        style={{
+          fontFamily: 'var(--font-display)',
+          fontSize: 16,
+          fontWeight: 700,
+          margin: '10px 0 5px',
+        }}
+      >
+        {children}
+      </h2>
+    );
+  },
+
+  h3({ children }: MarkdownProps) {
+    return (
+      <h3
+        style={{
+          fontFamily: 'var(--font-display)',
+          fontSize: 14,
+          fontWeight: 700,
+          margin: '8px 0 4px',
+        }}
+      >
+        {children}
+      </h3>
+    );
+  },
+
+  // Tables (remark-gfm) — minimal but readable on a narrow chat column
+  table({ children }: MarkdownProps) {
+    return (
+      <div style={{ overflowX: 'auto', margin: '8px 0' }}>
+        <table
+          style={{
+            borderCollapse: 'collapse',
+            fontSize: 13,
+            width: '100%',
+          }}
+        >
+          {children}
+        </table>
+      </div>
+    );
+  },
+
+  th({ children }: MarkdownProps) {
+    return (
+      <th
+        style={{
+          textAlign: 'left',
+          padding: '6px 8px',
+          borderBottom: '1px solid var(--border-default)',
+          fontWeight: 600,
+          background: 'var(--bg-surface-sunken)',
+        }}
+      >
+        {children}
+      </th>
+    );
+  },
+
+  td({ children }: MarkdownProps) {
+    return (
+      <td
+        style={{
+          padding: '6px 8px',
+          borderBottom: '1px solid var(--border-subtle)',
+          verticalAlign: 'top',
+        }}
+      >
+        {children}
+      </td>
+    );
+  },
+
+  a({ children, href }: MarkdownProps & { href?: string }) {
+    return (
+      <a
+        href={href}
+        target="_blank"
+        rel="noopener noreferrer"
+        style={{ color: 'var(--color-primary)', textDecoration: 'underline' }}
+      >
+        {children}
+      </a>
+    );
+  },
+
+  blockquote({ children }: MarkdownProps) {
+    return (
+      <blockquote
+        style={{
+          borderLeft: '3px solid var(--border-strong)',
+          paddingLeft: 10,
+          margin: '8px 0',
+          color: 'var(--text-secondary)',
+          fontStyle: 'italic',
+        }}
+      >
+        {children}
+      </blockquote>
+    );
+  },
+
+  hr() {
+    return (
+      <hr
+        style={{
+          border: 'none',
+          borderTop: '1px solid var(--border-subtle)',
+          margin: '10px 0',
+        }}
+      />
+    );
+  },
+
+  strong({ children }: MarkdownProps) {
+    return <strong style={{ fontWeight: 700 }}>{children}</strong>;
+  },
+
+  em({ children }: MarkdownProps) {
+    return <em style={{ fontStyle: 'italic' }}>{children}</em>;
+  },
+};
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * Diff-band styles (kept local to avoid extra CSS file)
+ * ───────────────────────────────────────────────────────────────────────── */
+
+const diffContainerStyle: React.CSSProperties = {
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 0,
+  margin: '8px 0',
+  border: '1px solid var(--border-default)',
+  borderRadius: 6,
+  overflow: 'hidden',
+};
+
+const diffFilePathStyle: React.CSSProperties = {
+  padding: '5px 10px',
+  background: 'var(--bg-surface-sunken)',
+  borderBottom: '1px solid var(--border-subtle)',
+  fontFamily: 'var(--font-mono)',
+  fontSize: 11,
+  color: 'var(--text-tertiary)',
+};
+
+const diffBandPreStyle: React.CSSProperties = {
+  margin: 0,
+  padding: '6px 10px 8px',
+  fontFamily: 'var(--font-mono)',
+  fontSize: 11,
+  lineHeight: 1.55,
+  whiteSpace: 'pre-wrap',
+  wordBreak: 'break-word',
+};
+
+const diffBandLabelStyle: React.CSSProperties = {
+  display: 'inline-block',
+  padding: '2px 8px',
+  fontFamily: 'var(--font-mono)',
+  fontSize: 10,
+  fontWeight: 700,
+  letterSpacing: '0.04em',
+};
+
+const diffBandRemoveStyle: React.CSSProperties = {
+  background: 'var(--bg-diff-remove, rgba(239,68,68,0.08))',
+  borderLeft: '3px solid var(--color-destructive)',
+  color: 'var(--color-destructive)',
+};
+
+const diffBandAddStyle: React.CSSProperties = {
+  background: 'var(--bg-diff-add, rgba(16,185,129,0.08))',
+  borderLeft: '3px solid var(--color-success)',
+  color: 'var(--color-success)',
+};
+
+const diffBandSeparatorStyle: React.CSSProperties = {
+  height: 1,
+  background: 'var(--border-subtle)',
+};
+
+const preFallbackStyle: React.CSSProperties = {
+  background: 'var(--bg-surface-sunken)',
+  border: '1px solid var(--border-subtle)',
+  borderRadius: 6,
+  padding: '10px 12px',
+  overflowX: 'auto',
+  margin: '8px 0',
+  fontFamily: 'var(--font-mono)',
+  fontSize: 12,
+  lineHeight: 1.5,
+};
