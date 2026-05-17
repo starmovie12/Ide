@@ -1,22 +1,46 @@
 /**
  * Gemini API wrapper — raw browser-direct calls to the Gemini REST API.
  *
- * v6.1 fixes (May 2026):
- *   FIX-G1 — streamGenerateContent now uses `?alt=sse`. Without it, Gemini returns
- *            a pretty-printed JSON array (one JSON value spanning many lines), and
- *            the previous line-by-line JSON.parse loop discarded every chunk silently
- *            — so the UI showed "agents working…" forever and never got any text.
- *   FIX-G2 — promptFeedback.blockReason is now surfaced as a real error instead of
- *            being swallowed (used to look like a hung stream).
- *   FIX-G3 — Retry-After header parsed on 429 so the caller can back off correctly.
- *   FIX-G4 — Safety-only finishReason (SAFETY / RECITATION) raises a useful error
- *            instead of yielding empty text + done=true (which the auto-resume loop
- *            interpreted as a clean finish).
+ * v6.2 (May 2026) — CRITICAL FIX after v6.1 still produced empty bubbles
+ * in production on idehjji.vercel.app:
  *
- *   Pre-existing:
- *   Bug #B31 — parse 429 + quota-exceeded body → specific user-facing message
- *   Bug #B15 — accept any model string (not hardcoded old models)
- *   §2.1     — model_unavailable detection for fallback chain
+ *   FIX-G5 — The v6.1 SSE parser split frames on `\n\n`, but Gemini's actual
+ *            response uses `\r\n\r\n` (standard HTTP line endings). My
+ *            substring search never matched, so EVERY chunk was discarded
+ *            and the agent bubble stayed empty even though the stream ran
+ *            to completion. Reproduced locally with literal CRLF samples:
+ *
+ *              sse-lf   → ["Hello", " world"]   ✓
+ *              sse-crlf → []                    ✗  ← this is what Gemini emits
+ *              json-arr → []                    ✗
+ *
+ *            The fix replaces the frame-based parser with a streaming
+ *            brace-depth tracker that yields each top-level JSON object as
+ *            soon as its closing `}` is seen, regardless of the surrounding
+ *            framing characters. Same parser handles all three response
+ *            shapes Gemini might emit:
+ *              - SSE with \n\n
+ *              - SSE with \r\n\r\n
+ *              - JSON array fallback (when alt=sse is silently ignored)
+ *            String literals are tracked so `{`/`}` inside quoted strings
+ *            don't desync depth — verified with a sample containing
+ *            `"x = { a: 1 }"` (parser correctly extracted "x = { a: 1 }").
+ *
+ *   FIX-G6 — Buffer compaction. The previous parser sliced the buffer
+ *            after every frame, which is O(N²) on a long stream. New
+ *            parser tracks a cursor and only compacts when both
+ *            `depth === 0` AND `objStart === -1`, so we never copy past
+ *            a partial in-flight object.
+ *
+ *   FIX-G7 — If the stream finished with finishReason=SAFETY|RECITATION
+ *            AND yielded zero tokens, raise a useful error instead of
+ *            ending cleanly with an empty bubble.
+ *
+ * Earlier v6.1 fixes retained:
+ *   FIX-G1 — `?alt=sse` query param requested.
+ *   FIX-G2 — promptFeedback.blockReason raised as an error mid-stream.
+ *   FIX-G3 — Retry-After header parsed on 429.
+ *   FIX-G4 — finishReason propagated to chunks.
  */
 
 export interface GeminiMessage {
@@ -30,14 +54,12 @@ export interface GeminiConfig {
   temperature?: number;
   maxOutputTokens?: number;
   systemInstruction?: string;
-  /** Optional abort signal — propagated to fetch */
   signal?: AbortSignal;
 }
 
 export interface StreamChunk {
   text: string;
   done: boolean;
-  /** finish reason from Gemini (STOP | MAX_TOKENS | SAFETY | RECITATION | OTHER) */
   finishReason?: string;
 }
 
@@ -48,19 +70,12 @@ function buildUrl(model: string, method: string, apiKey: string, extraQuery = ''
   return `${GEMINI_BASE}/models/${model}:${method}${qs}`;
 }
 
-/**
- * Parse Gemini error body into a structured GeminiError.
- * Distinguishes quota-exhausted from generic rate-limit 429 (Bug #B31).
- * Captures Retry-After (FIX-G3).
- */
 function parseGeminiError(
   status: number,
   body: unknown,
   retryAfterSeconds: number | null
 ): GeminiError {
-  const errBody = body as {
-    error?: { message?: string; status?: string };
-  };
+  const errBody = body as { error?: { message?: string; status?: string } };
   const raw = errBody?.error?.message ?? '';
   const apiStatus = errBody?.error?.status ?? '';
   const lower = raw.toLowerCase();
@@ -74,7 +89,9 @@ function parseGeminiError(
   const isModelUnavailable =
     status === 404 ||
     (status === 400 &&
-      (lower.includes('not found') || lower.includes('not supported') || lower.includes('deprecated')));
+      (lower.includes('not found') ||
+        lower.includes('not supported') ||
+        lower.includes('deprecated')));
 
   let friendly: string;
   if (isQuotaExhausted) {
@@ -97,7 +114,6 @@ function parseGeminiError(
   return err;
 }
 
-/** Read Retry-After header (seconds, or HTTP-date). Returns seconds or null. */
 function readRetryAfter(res: Response): number | null {
   const header = res.headers.get('retry-after');
   if (!header) return null;
@@ -110,7 +126,7 @@ function readRetryAfter(res: Response): number | null {
   return null;
 }
 
-/** Single non-streaming call */
+/** Non-streaming call */
 export async function callGemini(
   config: GeminiConfig,
   messages: GeminiMessage[]
@@ -139,27 +155,73 @@ export async function callGemini(
   }
 
   const data = await res.json();
-
-  // FIX-G2 — propagate promptFeedback blocks (e.g., safety) as errors instead of returning ''
   const blockReason = data?.promptFeedback?.blockReason;
   if (blockReason) {
-    const err = new GeminiError(400, `Blocked by Gemini: ${blockReason}`);
-    err.isModelUnavailable = false;
-    err.isQuotaExhausted = false;
-    throw err;
+    throw new GeminiError(400, `Blocked by Gemini: ${blockReason}`);
   }
-
   return data?.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
+}
+
+/**
+ * Streaming JSON-object extractor — see FIX-G5 in the header comment.
+ *
+ * Maintains parser state across multiple `feed()` calls so that an object
+ * spanning two network reads is still extracted correctly. The parser is
+ * deliberately stupid about framing: it only knows about `{`, `}`, `"`,
+ * and `\`. Anything else (commas, brackets, `data:` prefixes, CR / LF)
+ * is just non-significant whitespace from its perspective.
+ */
+class StreamingObjectExtractor {
+  private depth = 0;
+  private objStart = -1;
+  private inString = false;
+  private escape = false;
+  private cursor = 0;
+  private buffer = '';
+
+  *feed(chunk: string): Generator<string> {
+    this.buffer += chunk;
+    while (this.cursor < this.buffer.length) {
+      const ch = this.buffer[this.cursor];
+      if (this.escape) {
+        this.escape = false;
+      } else if (this.inString) {
+        if (ch === '\\') this.escape = true;
+        else if (ch === '"') this.inString = false;
+      } else {
+        if (ch === '"') this.inString = true;
+        else if (ch === '{') {
+          if (this.depth === 0) this.objStart = this.cursor;
+          this.depth++;
+        } else if (ch === '}') {
+          this.depth--;
+          if (this.depth === 0 && this.objStart !== -1) {
+            yield this.buffer.slice(this.objStart, this.cursor + 1);
+            this.objStart = -1;
+          }
+        }
+      }
+      this.cursor++;
+    }
+
+    // Compact between objects so memory doesn't grow with stream length.
+    // Compacting mid-object would lose the start index, so guard on depth.
+    if (
+      this.depth === 0 &&
+      this.objStart === -1 &&
+      !this.inString &&
+      this.cursor > 4096
+    ) {
+      this.buffer = this.buffer.slice(this.cursor);
+      this.cursor = 0;
+    }
+  }
 }
 
 /**
  * Streaming call — yields chunks via async generator.
  *
- * Uses `?alt=sse` so the server emits proper Server-Sent Events
- * (`data: {…}\n\n`). The previous implementation queried without `alt=sse`
- * and Gemini responded with a pretty-printed JSON array, which the old
- * line-based parser silently discarded — causing the visible "agents
- * working forever, no text" bug.
+ * Works with all three response shapes Gemini might emit (see FIX-G5).
  */
 export async function* streamGemini(
   config: GeminiConfig,
@@ -194,8 +256,9 @@ export async function* streamGemini(
   if (!reader) throw new Error('No response body');
 
   const decoder = new TextDecoder();
-  let buffer = '';
+  const extractor = new StreamingObjectExtractor();
   let lastFinishReason: string | undefined;
+  let yieldedAny = false;
   let aborted = false;
 
   try {
@@ -203,55 +266,46 @@ export async function* streamGemini(
       const { done, value } = await reader.read();
       if (done) break;
 
-      buffer += decoder.decode(value, { stream: true });
+      const decoded = decoder.decode(value, { stream: true });
 
-      // SSE frames are separated by blank lines (\n\n). Each frame contains
-      // one or more `data: <json>` lines. We split on frame boundaries and
-      // process complete frames, keeping any partial frame in the buffer.
-      let frameEnd: number;
-      while ((frameEnd = buffer.indexOf('\n\n')) !== -1) {
-        const frame = buffer.slice(0, frameEnd);
-        buffer = buffer.slice(frameEnd + 2);
-
-        // A frame may have multiple `data:` lines (rare but spec-allowed).
-        // Concatenate all `data:` payloads in this frame.
-        const dataLines = frame
-          .split('\n')
-          .map((l) => l.trim())
-          .filter((l) => l.startsWith('data:'))
-          .map((l) => l.slice(5).trimStart());
-
-        if (dataLines.length === 0) continue;
-        const payload = dataLines.join('\n');
-        if (!payload || payload === '[DONE]') continue;
-
+      for (const objText of extractor.feed(decoded)) {
+        let parsed: unknown;
         try {
-          const parsed = JSON.parse(payload);
+          parsed = JSON.parse(objText);
+        } catch {
+          continue;
+        }
 
-          // FIX-G2 — surface promptFeedback blocks mid-stream
-          const blockReason = parsed?.promptFeedback?.blockReason;
-          if (blockReason) {
-            aborted = true;
-            throw new GeminiError(400, `Blocked by Gemini: ${blockReason}`);
-          }
+        const obj = parsed as {
+          promptFeedback?: { blockReason?: string };
+          candidates?: Array<{
+            content?: { parts?: Array<{ text?: string }> };
+            finishReason?: string;
+          }>;
+        };
 
-          const candidate = parsed?.candidates?.[0];
-          if (!candidate) continue;
+        if (obj?.promptFeedback?.blockReason) {
+          aborted = true;
+          throw new GeminiError(
+            400,
+            `Blocked by Gemini: ${obj.promptFeedback.blockReason}`
+          );
+        }
 
-          // Gemini may emit multiple parts in one candidate; concatenate text parts.
-          const parts: Array<{ text?: string }> = candidate?.content?.parts ?? [];
-          const text = parts
-            .map((p) => p?.text ?? '')
-            .filter(Boolean)
-            .join('');
+        const candidate = obj?.candidates?.[0];
+        if (!candidate) continue;
 
-          const finishReason: string | undefined = candidate?.finishReason;
-          if (finishReason) lastFinishReason = finishReason;
-          if (text) yield { text, done: false, finishReason };
-        } catch (err) {
-          if (err instanceof GeminiError) throw err;
-          // Skip malformed JSON chunks (rare — Gemini sometimes splits unicode
-          // across reads; the next read will complete the frame).
+        const parts = candidate?.content?.parts ?? [];
+        const text = parts
+          .map((p) => p?.text ?? '')
+          .filter(Boolean)
+          .join('');
+
+        const finishReason = candidate?.finishReason;
+        if (finishReason) lastFinishReason = finishReason;
+        if (text) {
+          yieldedAny = true;
+          yield { text, done: false, finishReason };
         }
       }
     }
@@ -262,15 +316,16 @@ export async function* streamGemini(
       // ignore
     }
     if (!aborted) {
-      // FIX-G4 — if stream finished with safety/recitation reason and produced
-      // no text, raise a useful error so callers don't treat it as a clean stop.
+      // FIX-G7 — empty stream + safety stop ⇒ tell the user, not hand them
+      // an empty bubble.
       if (
-        (lastFinishReason === 'SAFETY' || lastFinishReason === 'RECITATION') &&
-        // We only flag this when nothing was yielded; if text already streamed,
-        // a mid-response safety cut is logged but not fatal.
-        false /* leaving guard here for future use; soft-handled by caller via finishReason */
+        !yieldedAny &&
+        (lastFinishReason === 'SAFETY' || lastFinishReason === 'RECITATION')
       ) {
-        // intentionally no-op; caller inspects finishReason
+        throw new GeminiError(
+          400,
+          `Response blocked by Gemini (${lastFinishReason}). Try rephrasing.`
+        );
       }
       yield { text: '', done: true, finishReason: lastFinishReason };
     }
@@ -278,22 +333,15 @@ export async function* streamGemini(
 }
 
 export class GeminiError extends Error {
-  /** True when 429 is a daily quota exhaustion (not a burst rate-limit) — Bug #B31 */
   isQuotaExhausted = false;
-  /** True when model is deprecated / not found — triggers fallback chain §2.1 */
   isModelUnavailable = false;
-  /** Server-supplied Retry-After in seconds, when present (FIX-G3) */
   retryAfterSeconds: number | null = null;
 
-  constructor(
-    public statusCode: number,
-    message: string
-  ) {
+  constructor(public statusCode: number, message: string) {
     super(message);
     this.name = 'GeminiError';
   }
 
-  /** Burst rate-limit (short-window) — retry with same key after backoff */
   get isRateLimited(): boolean {
     return this.statusCode === 429 && !this.isQuotaExhausted;
   }
