@@ -286,7 +286,36 @@ export function Header({ onAddAgent }: HeaderProps) {
               {navItems.map((item) => {
                 const Icon = item.icon;
                 const isActive = activeTab === item.id;
-                const inner = (
+
+                // Settings goes to /settings route
+                if (item.href !== '/') {
+                  return (
+                    <Link key={item.id} href={item.href}>
+                      <a
+                        onClick={() => {
+                          setActiveTab(item.id);
+                          setMenuOpen(false);
+                        }}
+                        style={{
+                          display: 'flex', alignItems: 'center', gap: 10,
+                          width: '100%', padding: '8px 12px',
+                          borderRadius: 'var(--radius-base)',
+                          background: 'none',
+                          color: 'var(--text-secondary)',
+                          fontSize: 14, fontFamily: 'var(--font-body)',
+                          cursor: 'pointer', textDecoration: 'none',
+                          transition: 'background 120ms',
+                        }}
+                        className="hover:bg-[var(--bg-surface-elevated)]"
+                      >
+                        <item.icon size={14} style={{ flexShrink: 0 }} />
+                        {item.label}
+                      </a>
+                    </Link>
+                  );
+                }
+
+                return (
                   <button
                     key={item.id}
                     onClick={() => {
@@ -305,22 +334,13 @@ export function Header({ onAddAgent }: HeaderProps) {
                     className="hover:bg-[var(--bg-surface-elevated)]"
                     aria-current={isActive ? 'page' : undefined}
                   >
-                    <Icon size={14} style={{ flexShrink: 0 }} />
+                    <item.icon size={14} style={{ flexShrink: 0 }} />
                     {item.label}
                     {isActive && (
                       <span style={{ marginLeft: 'auto', width: 6, height: 6, borderRadius: '50%', background: 'var(--color-primary)' }} />
                     )}
                   </button>
                 );
-                // Settings navigates to /settings via Link
-                if (item.href !== '/') {
-                  return (
-                    <Link key={item.id} href={item.href} onClick={() => setMenuOpen(false)}>
-                      {inner}
-                    </Link>
-                  );
-                }
-                return inner;
               })}
 
               {/* Divider */}
