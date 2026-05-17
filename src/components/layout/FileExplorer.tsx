@@ -9,6 +9,8 @@ import {
   FolderPlus,
   Search,
   X,
+  Github,
+  Loader2,
 } from 'lucide-react';
 import {
   DndContext,
@@ -23,6 +25,9 @@ import { useDraggable, useDroppable } from '@dnd-kit/core';
 import { useUIStore } from '@/lib/store/uiStore';
 import { useEditorStore, type FileEntry } from '@/lib/store/editorStore';
 import { useDiffStore } from '@/lib/store/diffStore';
+import { useBlueprintStore } from '@/lib/store/blueprintStore';
+import { useChatStore } from '@/lib/store/chatStore';
+import { uploadSingleFile } from '@/lib/github/push';
 import { getFileIcon } from '@/lib/utils/fileIcons';
 import { cn } from '@/lib/utils/cn';
 
@@ -99,6 +104,39 @@ export function FileExplorer({ className }: FileExplorerProps) {
   const { files, openFile, createFile, deleteFile, renameFile, moveFile, activeFileId, openFiles } =
     useEditorStore();
   const { pendingDiffs } = useDiffStore();
+  const { githubToken, getRepoConnection } = useBlueprintStore();
+  const { activeChatId } = useChatStore();
+
+  // GitHub upload state
+  const [uploadingPath, setUploadingPath] = useState<string | null>(null);
+  const [uploadSuccess, setUploadSuccess] = useState<string | null>(null);
+
+  const repoConn = activeChatId ? getRepoConnection(activeChatId) : null;
+  const hasGitHub = !!(githubToken && repoConn);
+
+  const handleUploadFile = useCallback(async (node: TreeNode) => {
+    if (!githubToken || !repoConn || !node.fileId) return;
+    const fileEntry = files.find((f) => f.id === node.fileId);
+    if (!fileEntry) return;
+
+    setUploadingPath(node.path);
+    try {
+      await uploadSingleFile({
+        githubToken,
+        owner: repoConn.owner,
+        repo: repoConn.repo,
+        defaultBranch: repoConn.ref || 'main',
+        filePath: fileEntry.path,
+        fileContent: fileEntry.content,
+      });
+      setUploadSuccess(node.path);
+      setTimeout(() => setUploadSuccess(null), 2500);
+    } catch (err) {
+      console.error('GitHub upload failed:', err);
+    } finally {
+      setUploadingPath(null);
+    }
+  }, [githubToken, repoConn, files]);
 
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set());
   const [search, setSearch] = useState('');
@@ -384,6 +422,10 @@ export function FileExplorer({ className }: FileExplorerProps) {
               onSetInlineValue={setInlineValue}
               onCommitInlineEdit={commitInlineEdit}
               onCancelInlineEdit={() => setInlineEdit(null)}
+              hasGitHub={hasGitHub}
+              uploadingPath={uploadingPath}
+              uploadSuccess={uploadSuccess}
+              onUploadFile={handleUploadFile}
             />
           ))}
         </div>
@@ -440,6 +482,10 @@ function FileTreeNode({
   onSetInlineValue,
   onCommitInlineEdit,
   onCancelInlineEdit,
+  hasGitHub = false,
+  uploadingPath,
+  uploadSuccess,
+  onUploadFile,
 }: {
   node: TreeNode;
   depth: number;
@@ -455,6 +501,10 @@ function FileTreeNode({
   onSetInlineValue: (v: string) => void;
   onCommitInlineEdit: () => void;
   onCancelInlineEdit: () => void;
+  hasGitHub?: boolean;
+  uploadingPath?: string | null;
+  uploadSuccess?: string | null;
+  onUploadFile?: (node: TreeNode) => void;
 }) {
   const isExpanded = expandedFolders.has(node.path);
   const isActive = node.type === 'file' && node.path === activeFilePath;
@@ -529,6 +579,10 @@ function FileTreeNode({
                 onSetInlineValue={onSetInlineValue}
                 onCommitInlineEdit={onCommitInlineEdit}
                 onCancelInlineEdit={onCancelInlineEdit}
+                hasGitHub={hasGitHub}
+                uploadingPath={uploadingPath}
+                uploadSuccess={uploadSuccess}
+                onUploadFile={onUploadFile}
               />
             ))}
           </div>
@@ -555,47 +609,103 @@ function FileTreeNode({
     );
   }
 
+  const isUploading = uploadingPath === node.path;
+  const isUploaded = uploadSuccess === node.path;
+
   return (
-    <button
-      ref={dragRef}
-      {...listeners}
-      {...attributes}
-      data-testid={`file-${node.name}`}
-      onClick={() => onFileClick(node)}
-      onContextMenu={(e) => onContextMenu(e, node)}
-      className="flex items-center gap-1.5 w-full rounded-md text-left transition-colors hover:bg-[var(--bg-surface-overlay)]"
-      style={{
-        padding: `4px 8px 4px ${8 + depth * 14}px`,
-        border: 'none',
-        background: isActive ? 'var(--bg-surface-overlay)' : 'none',
-        cursor: 'pointer',
-        color: isActive ? 'var(--text-primary)' : 'var(--text-secondary)',
-        fontSize: 12,
-        fontFamily: 'var(--font-body)',
-        opacity: isDragging ? 0.4 : 1,
-        borderLeft: isActive ? '2px solid var(--color-primary)' : '2px solid transparent',
-        paddingLeft: isActive ? `${6 + depth * 14}px` : `${8 + depth * 14}px`,
-      }}
-    >
-      <span style={{ width: 11, flexShrink: 0 }} />
-      <Icon size={13} style={{ flexShrink: 0, color }} />
-      <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-        {node.name}
-      </span>
-      {node.hasDiff && (
-        <span
-          style={{
-            width: 6,
-            height: 6,
-            borderRadius: '50%',
-            background: 'var(--color-warning)',
-            flexShrink: 0,
-            marginRight: 2,
+    <div style={{ position: 'relative', display: 'flex', alignItems: 'center' }} className="group">
+      <button
+        ref={dragRef}
+        {...listeners}
+        {...attributes}
+        data-testid={`file-${node.name}`}
+        onClick={() => onFileClick(node)}
+        onContextMenu={(e) => onContextMenu(e, node)}
+        className="flex items-center gap-1.5 w-full rounded-md text-left transition-colors hover:bg-[var(--bg-surface-overlay)]"
+        style={{
+          padding: `4px 8px 4px ${8 + depth * 14}px`,
+          border: 'none',
+          background: isActive ? 'var(--bg-surface-overlay)' : 'none',
+          cursor: 'pointer',
+          color: isActive ? 'var(--text-primary)' : 'var(--text-secondary)',
+          fontSize: 12,
+          fontFamily: 'var(--font-body)',
+          opacity: isDragging ? 0.4 : 1,
+          borderLeft: isActive ? '2px solid var(--color-primary)' : '2px solid transparent',
+          paddingLeft: isActive ? `${6 + depth * 14}px` : `${8 + depth * 14}px`,
+          flex: 1,
+          minWidth: 0,
+        }}
+      >
+        <span style={{ width: 11, flexShrink: 0 }} />
+        <Icon size={13} style={{ flexShrink: 0, color }} />
+        <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+          {node.name}
+        </span>
+        {node.hasDiff && (
+          <span
+            style={{
+              width: 6,
+              height: 6,
+              borderRadius: '50%',
+              background: 'var(--color-warning)',
+              flexShrink: 0,
+              marginRight: 2,
+            }}
+            title="Pending diff"
+          />
+        )}
+      </button>
+
+      {/* GitHub one-click upload — shown when a repo is connected */}
+      {hasGitHub && node.type === 'file' && (
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            onUploadFile?.(node);
           }}
-          title="Pending diff"
-        />
+          disabled={isUploading}
+          title={
+            isUploaded
+              ? 'Uploaded!'
+              : isUploading
+              ? 'Uploading…'
+              : `Upload ${node.path} to GitHub`
+          }
+          aria-label={`Upload ${node.name} to GitHub`}
+          className="opacity-0 group-hover:opacity-100 transition-opacity"
+          style={{
+            flexShrink: 0,
+            marginRight: 4,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            width: 22,
+            height: 22,
+            borderRadius: 4,
+            border: isUploaded
+              ? '1px solid var(--color-success)'
+              : '1px solid var(--border-subtle)',
+            background: isUploaded
+              ? 'var(--color-success-subtle)'
+              : 'var(--bg-surface-elevated)',
+            color: isUploaded
+              ? 'var(--color-success)'
+              : isUploading
+              ? 'var(--text-quaternary)'
+              : 'var(--text-tertiary)',
+            cursor: isUploading ? 'not-allowed' : 'pointer',
+            transition: 'all 150ms',
+          }}
+        >
+          {isUploading ? (
+            <Loader2 size={11} style={{ animation: 'spin 1s linear infinite' }} />
+          ) : (
+            <Github size={11} />
+          )}
+        </button>
       )}
-    </button>
+    </div>
   );
 }
 
