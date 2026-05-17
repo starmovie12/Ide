@@ -333,6 +333,11 @@ export function ChatFooter() {
 
   return (
     <footer
+      // v6.1 — `mb-20 sm:mb-0` pushes the input above the floating Glass
+      // Island on mobile (the island is `sm:hidden` so on desktop we
+      // remove the margin to keep the footer flush with the viewport
+      // bottom). 80 px clearance = island height (~60) + 20 inset.
+      className="mb-20 sm:mb-0"
       style={{
         background: 'var(--bg-surface)',
         borderTop: '1px solid var(--border-default)',
