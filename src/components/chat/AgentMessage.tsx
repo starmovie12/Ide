@@ -1,5 +1,5 @@
-import { useMemo } from 'react';
-import { GitMerge } from 'lucide-react';
+import { useMemo, useState, useCallback } from 'react';
+import { GitMerge, Copy, Check as CheckIcon } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
@@ -322,8 +322,123 @@ type CodeProps = MarkdownProps & {
   className?: string;
 };
 
+/** Copy-to-clipboard button shown in the top-right corner of every fenced code block. */
+function CopyButton({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1800);
+    } catch {
+      // Fallback for older browsers / http contexts
+      const el = document.createElement('textarea');
+      el.value = text;
+      el.style.position = 'fixed';
+      el.style.opacity = '0';
+      document.body.appendChild(el);
+      el.focus();
+      el.select();
+      document.execCommand('copy');
+      document.body.removeChild(el);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1800);
+    }
+  }, [text]);
+
+  return (
+    <button
+      onClick={handleCopy}
+      title={copied ? 'Copied!' : 'Copy code'}
+      aria-label={copied ? 'Copied!' : 'Copy code'}
+      style={{
+        position: 'absolute',
+        top: 6,
+        right: 6,
+        display: 'flex',
+        alignItems: 'center',
+        gap: 4,
+        padding: '3px 8px',
+        borderRadius: 'var(--radius-sm)',
+        border: '1px solid var(--border-subtle)',
+        background: copied ? 'var(--color-success-subtle)' : 'var(--bg-surface-elevated)',
+        color: copied ? 'var(--color-success)' : 'var(--text-tertiary)',
+        fontSize: 11,
+        fontFamily: 'var(--font-body)',
+        fontWeight: 500,
+        cursor: 'pointer',
+        transition: 'all 150ms',
+        zIndex: 1,
+      }}
+    >
+      {copied ? <CheckIcon size={11} /> : <Copy size={11} />}
+      {copied ? 'Copied' : 'Copy'}
+    </button>
+  );
+}
+
+/** Fenced code block with language label + copy button — strictly separated from prose. */
+function CodeBlock({ language, code }: { language: string; code: string }) {
+  return (
+    <div
+      style={{
+        position: 'relative',
+        margin: '10px 0',
+        border: '1px solid var(--border-subtle)',
+        borderRadius: 8,
+        overflow: 'hidden',
+        background: 'var(--bg-surface-sunken)',
+      }}
+    >
+      {/* Language label bar */}
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          padding: '5px 10px',
+          background: 'var(--bg-surface)',
+          borderBottom: '1px solid var(--border-subtle)',
+        }}
+      >
+        <span
+          style={{
+            fontSize: 10,
+            fontFamily: 'var(--font-mono)',
+            fontWeight: 600,
+            color: 'var(--text-quaternary)',
+            textTransform: 'uppercase',
+            letterSpacing: '0.06em',
+          }}
+        >
+          {language}
+        </span>
+        <CopyButton text={code} />
+      </div>
+      <SyntaxHighlighter
+        style={oneDark}
+        language={language}
+        PreTag="div"
+        customStyle={{
+          background: 'transparent',
+          border: 'none',
+          borderRadius: 0,
+          padding: '10px 12px',
+          margin: 0,
+          fontSize: 12,
+          lineHeight: 1.5,
+        }}
+        codeTagProps={{ style: { fontFamily: 'var(--font-mono)' } }}
+      >
+        {code}
+      </SyntaxHighlighter>
+    </div>
+  );
+}
+
 const markdownComponents = {
-  // Code: inline → tinted pill; fenced block → syntax-highlighted
+  // Code: inline → tinted pill; fenced block → full CodeBlock with copy button
   code({ inline, className, children, ...props }: CodeProps) {
     const text = String(children ?? '').replace(/\n$/, '');
     const match = /language-(\w+)/.exec(className ?? '');
@@ -345,29 +460,7 @@ const markdownComponents = {
       );
     }
 
-    return (
-      <SyntaxHighlighter
-        // oneDark blends well with the dark Glass surface; we override the
-        // default background so the highlighter doesn't fight the bubble.
-        style={oneDark}
-        language={match[1]}
-        PreTag="div"
-        customStyle={{
-          background: 'var(--bg-surface-sunken)',
-          border: '1px solid var(--border-subtle)',
-          borderRadius: 6,
-          padding: '10px 12px',
-          margin: '8px 0',
-          fontSize: 12,
-          lineHeight: 1.5,
-        }}
-        codeTagProps={{
-          style: { fontFamily: 'var(--font-mono)' },
-        }}
-      >
-        {text}
-      </SyntaxHighlighter>
-    );
+    return <CodeBlock language={match[1]} code={text} />;
   },
 
   p({ children }: MarkdownProps) {
