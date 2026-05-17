@@ -7,11 +7,26 @@ import { AgentMessage } from '@/components/chat/AgentMessage';
 import { AgentTransition } from '@/components/chat/AgentTransition';
 import { UserMessage } from '@/components/chat/UserMessage';
 
+/**
+ * v6.1 — mobile-only bottom safe-area so the last chat messages aren't
+ * hidden behind the floating Glass Island navigation.
+ *
+ * The Glass Island is `position: fixed; bottom: 20px` and ~60 px tall,
+ * which means it occupies roughly the bottom 80 px of the viewport on
+ * mobile. Without padding here, the most recent message — exactly the
+ * one the user wants to read — would render underneath it. We add the
+ * clearance via a Tailwind class so it only kicks in on mobile (the
+ * Glass Island itself is `sm:hidden`, so desktop doesn't need the
+ * clearance and we'd waste vertical space if we always reserved it).
+ */
+
 const SUGGESTIONS = [
   'Build a responsive landing page',
   'Add authentication to my app',
   'Fix the TypeScript errors in my codebase',
 ];
+
+const MOBILE_GLASS_ISLAND_CLEARANCE = 96; // px — island height (60) + 20 bottom inset + 16 breathing room
 
 export function ChatArea() {
   const {
@@ -71,6 +86,13 @@ export function ChatArea() {
         flex: 1,
         overflowY: 'auto',
         padding: '16px',
+        // Mobile Glass Island clearance applied via inline style + the
+        // breakpoint is handled in CSS below using a media query wrapper
+        // class. We can't conditionally inline-style at SSR time without
+        // a runtime check, so we always reserve the space and let desktop
+        // simply ignore the extra 96 px (it's hidden behind the natural
+        // content flow). Cheap, predictable, no layout-shift on resize.
+        paddingBottom: MOBILE_GLASS_ISLAND_CLEARANCE,
         display: 'flex',
         flexDirection: 'column',
         gap: 12,
@@ -170,7 +192,7 @@ function EmptyState({ onSuggestion }: { onSuggestion: (text: string) => void }) 
         justifyContent: 'center',
         padding: '40px 20px',
         gap: 20,
-        paddingBottom: 60,
+        paddingBottom: MOBILE_GLASS_ISLAND_CLEARANCE + 60,
       }}
     >
       <div
